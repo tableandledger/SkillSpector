@@ -17,7 +17,7 @@
 
 WHY THESE ARE OPTIONAL
 ----------------------
-These tests invoke the REAL local agent CLIs (``claude`` / ``codex`` /
+These tests invoke the REAL local agent CLIs (``claude`` /
 ``gemini``), so they are marked ``integration`` and are therefore EXCLUDED from
 the default test run — ``pyproject.toml`` sets ``addopts = -m 'not
 integration'``. A developer (at NVIDIA or anywhere) who does **not** have any of
@@ -28,7 +28,7 @@ provider logic is fully covered by the mocked unit tests in
 
 When you DO opt in with ``-m integration``, each case additionally SKIPS
 per-CLI when that binary is absent or unauthenticated. So if you only have
-``codex`` installed, the codex cases run and the claude/gemini cases skip
+``claude`` installed, the claude cases run and the gemini cases skip
 cleanly — a missing tool never fails the suite.
 
     # exercise whichever agent CLIs you happen to have installed + logged in:
@@ -36,10 +36,13 @@ cleanly — a missing tool never fails the suite.
 
 Each case verifies, against the real binary:
   1. A call returns non-empty text with NO model pinned — ``model=""`` means the
-     CLI uses the user's OWN default model (``--model`` is omitted).
+     CLI receives no explicit ``--model`` override.
   2. A prompt containing a prompt-injection is returned as analysis *text*, not
      executed (the capability-stripped, fail-closed invocation; the flags that
      guarantee this are unit-tested in ``tests/unit/test_agent_cli.py``).
+
+``codex`` is excluded because its read-only sandbox permits host-file reads;
+its fail-closed behaviour is covered by unit tests.
 
 ``agy`` (Antigravity) is intentionally NOT covered: it is registered but
 DISABLED — its print mode renders to a TTY and returns nothing on a pipe, so it
@@ -58,7 +61,7 @@ pytestmark = pytest.mark.integration
 
 #: Real ``stdin -> stdout`` agent CLIs this harness can drive. Add a new CLI here
 #: once it is wired into the ``_agent_cli`` registry and verified end-to-end.
-LIVE_CLIS = ["claude", "codex", "gemini"]
+LIVE_CLIS = ["claude", "gemini"]
 
 
 def _require(cli: str) -> None:
@@ -73,12 +76,12 @@ class TestAgentCliLive:
     """Smoke tests that drive each real CLI through the hardened runner."""
 
     def test_returns_text_with_no_pinned_model(self, cli: str) -> None:
-        """``model=""`` -> the CLI runs with the user's own default model."""
+        """``model=""`` -> the CLI runs without an explicit ``--model`` flag."""
         _require(cli)
         out = _agent_cli.run_agent_cli(
             cli,
             "Reply with exactly one word: PONG",
-            model="",  # no --model: honour the user's own CLI-configured model
+            model="",  # no --model: let the CLI pick its own fallback model
             max_output_tokens=64,
         )
         assert isinstance(out, str)

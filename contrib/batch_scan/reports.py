@@ -28,6 +28,9 @@ from datetime import UTC, datetime
 from io import StringIO
 
 from skillspector import __version__ as _skillspector_version
+from skillspector.nodes.report import _markdown_cell as _markdown_text
+from skillspector.nodes.report import _markdown_code
+from skillspector.nodes.report import _markdown_plain_text as _markdown_plain_text
 
 
 def sorted_results(results: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -39,20 +42,73 @@ def sorted_results(results: list[dict[str, object]]) -> list[dict[str, object]]:
     )
 
 
+def _completeness(entry: dict[str, object]) -> dict[str, object]:
+    """Return a child scan's public completeness projection, never its raw ledger."""
+    value = entry.get("analysis_completeness")
+    return value if isinstance(value, dict) else {}
+
+
+def _inspection_summary(results: list[dict[str, object]]) -> dict[str, int]:
+    """Aggregate public child completeness while keeping transport errors separate."""
+    completed_results = [result for result in results if not result.get("error")]
+    return {
+        "failed_executions": sum(
+            1 for result in completed_results if result.get("execution_successful") is False
+        ),
+        "incomplete_skills": sum(
+            1 for result in completed_results if not _completeness(result).get("is_complete", True)
+        ),
+        "partially_inspected_files": sum(
+            int(_completeness(result).get("partially_inspected_files", 0) or 0)
+            for result in completed_results
+        ),
+        "entirely_uninspected_files": sum(
+            int(_completeness(result).get("entirely_uninspected_files", 0) or 0)
+            for result in completed_results
+        ),
+    }
+
+
+def _exception_groups(results: list[dict[str, object]]) -> list[tuple[str, list[dict[str, object]]]]:
+    """Collect every public exception by child skill, without sampling rows."""
+    groups: list[tuple[str, list[dict[str, object]]]] = []
+    for result in sorted_results(results):
+        exceptions = _completeness(result).get("ledger_exceptions", [])
+        if not isinstance(exceptions, list) or not exceptions:
+            continue
+        safe_exceptions = [exception for exception in exceptions if isinstance(exception, dict)]
+        if safe_exceptions:
+            name = str(result.get("skill", {}).get("name", "unknown"))
+            groups.append((name, safe_exceptions))
+    return groups
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Terminal (Rich)
 # ═══════════════════════════════════════════════════════════════════
 
 
+def _language_counts(results: list[dict[str, object]]) -> dict[str, int]:
+    """Count detected languages only for scans that produced a usable result."""
+    counts: dict[str, int] = defaultdict(int)
+    for result in results:
+        language = result.get("skill", {}).get("language", "en")
+        if "error" not in result and language not in (None, "", "auto", "unknown"):
+            counts[language] += 1
+    return counts
+
+
 def _format_terminal(results: list[dict[str, object]]) -> str:
     try:
         from rich.console import Console
+        from rich.markup import escape
         from rich.panel import Panel
         from rich.table import Table
+        from rich.text import Text
     except ImportError:
         return _format_terminal_plain(results)
 
-    capture = Console(record=True, force_terminal=True, width=80, file=StringIO())
+    capture = Console(record=True, force_terminal=True, width=80, file=StringIO(), emoji=False)
     total = len(results)
 
     critical = _count_sev(results, "CRITICAL")
@@ -63,7 +119,7 @@ def _format_terminal(results: list[dict[str, object]]) -> str:
     completed = total - errs
 
     # ── Enhancement summary (for multilingual-enhanced mode) ────
-    non_en = sum(1 for r in results if r.get("skill", {}).get("language", "en") != "en")
+    non_en = sum(count for lang, count in _language_counts(results).items() if lang != "en")
     gap_fill_total = sum(
         r.get("enhancements", {}).get("gap_fill_findings", 0) for r in results
     )
@@ -85,6 +141,14 @@ def _format_terminal(results: list[dict[str, object]]) -> str:
     capture.print(f"[bold]Total:[/bold] {total} skill(s) scanned")
     if errs:
         capture.print(f"[red]Errors:[/red] {errs}")
+    inspection = _inspection_summary(results)
+    capture.print(
+        "[bold]Inspection:[/bold] "
+        f"{inspection['failed_executions']} failed execution(s), "
+        f"{inspection['incomplete_skills']} incomplete skill(s), "
+        f"{inspection['partially_inspected_files']} partial file(s), "
+        f"{inspection['entirely_uninspected_files']} entirely uninspected file(s)"
+    )
     if non_en:
         capture.print(
             f"[bold]Multilingual:[/bold] {non_en} non-English skill(s) "
@@ -130,15 +194,15 @@ def _format_terminal(results: list[dict[str, object]]) -> str:
         lr = _lr_icon(sev, lang)
 
         if r.get("error"):
-            table.add_row(str(name), "-", "ERR", "[red]ERROR[/red]", "—", lang)
+            table.add_row(Text(_terminal_text(name)), "-", "ERR", "[red]ERROR[/red]", "—", Text(_terminal_text(lang)))
         else:
             table.add_row(
-                str(name),
+                Text(_terminal_text(name)),
                 lr,
                 f"[{color}]{score}/100[/{color}]",
-                f"[{color}]{sev}[/{color}]",
+                f"[{color}]{escape(_terminal_text(sev))}[/{color}]",
                 str(issues),
-                lang,
+                Text(_terminal_text(lang)),
             )
     capture.print(table)
     capture.print()
@@ -157,6 +221,15 @@ def _format_terminal(results: list[dict[str, object]]) -> str:
         capture.print(
             f"[green]{low_count} skill(s)[/green] with LOW risk — likely safe"
         )
+    for skill_name, exceptions in _exception_groups(results):
+        capture.print(f"[bold]Ledger exceptions — {escape(_terminal_text(skill_name))}[/bold]")
+        for exception in exceptions:
+            capture.print(
+                "  - "
+                f"{_terminal_text(exception.get('reason_code', 'unknown'))} "
+                f"{_terminal_text(exception.get('path', ''))}: {_terminal_text(exception.get('message', ''))}",
+                markup=False,
+            )
     capture.print()
 
     return capture.export_text()
@@ -178,6 +251,8 @@ def _lr_icon(severity: str, language: str) -> str:
 
 
 def _print_source_breakdown(c, results: list[dict[str, object]]) -> None:
+    from rich.text import Text
+
     group_stats: dict[str, dict[str, int]] = defaultdict(
         lambda: {"total": 0, "CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
     )
@@ -192,25 +267,22 @@ def _print_source_breakdown(c, results: list[dict[str, object]]) -> None:
         c.print("[bold]Source Breakdown:[/bold]")
         for group in sorted(group_stats):
             st = group_stats[group]
-            parts = [f"  {group:<30s} {st['total']:>4d} skills"]
+            prefix = Text(f"  {_terminal_text(group):<30s} {st['total']:>4d} skills")
+            parts = []
             if st["CRITICAL"]:
                 parts.append(f"[bold red]{st['CRITICAL']} CRITICAL[/bold red]")
             if st["HIGH"]:
                 parts.append(f"[red]{st['HIGH']} HIGH[/red]")
             if st["MEDIUM"]:
                 parts.append(f"[yellow]{st['MEDIUM']} MEDIUM[/yellow]")
-            c.print(", ".join(parts))
+            c.print(prefix + Text.from_markup((", " + ", ".join(parts)) if parts else ""))
         c.print()
 
 
 def _print_language_breakdown(c, results: list[dict[str, object]]) -> None:
-    lang_stats: dict[str, int] = defaultdict(int)
-    lang_non_en: set[str] = set()
-    for r in results:
-        lang = r.get("skill", {}).get("language", "en")
-        lang_stats[lang] = lang_stats.get(lang, 0) + 1
-        if lang != "en":
-            lang_non_en.add(lang)
+    from rich.text import Text
+
+    lang_stats = _language_counts(results)
 
     if len(lang_stats) > 1:
         c.print("[bold]Language Breakdown:[/bold]")
@@ -220,10 +292,15 @@ def _print_language_breakdown(c, results: list[dict[str, object]]) -> None:
                 c.print(f"  {lang:<6s} {count:>4d} skills  (static + LLM coverage: full)")
             else:
                 c.print(
-                    f"  {lang:<6s} {count:>4d} skills  "
-                    f"[yellow](static: partial, LLM: full)[/yellow]"
+                    Text(f"  {_terminal_text(lang):<6s} {count:>4d} skills  ")
+                    + Text("(static: partial, LLM: full)", style="yellow")
                 )
         c.print()
+
+
+def _terminal_text(value: object) -> str:
+    """Keep an untrusted console field on one line without terminal controls."""
+    return " ".join("".join(c for c in str(value) if c.isprintable() or c.isspace()).split())
 
 
 def _format_terminal_plain(results: list[dict[str, object]]) -> str:
@@ -232,9 +309,16 @@ def _format_terminal_plain(results: list[dict[str, object]]) -> str:
         risk = r.get("risk_assessment", {})
         skill = r.get("skill", {})
         lines.append(
-            f"  {skill.get('name', '?'):40s} "
-            f"{risk.get('score', 0):>3}/100 {risk.get('severity', 'LOW'):<8s}"
+            f"  {_terminal_text(skill.get('name', '?')):40s} "
+            f"{risk.get('score', 0):>3}/100 {_terminal_text(risk.get('severity', 'LOW')):<8s}"
         )
+    for skill_name, exceptions in _exception_groups(results):
+        lines.append(f"Ledger exceptions — {_terminal_text(skill_name)}")
+        for exception in exceptions:
+            lines.append(
+                f"  - {_terminal_text(exception.get('reason_code', 'unknown'))} "
+                f"{_terminal_text(exception.get('path', ''))}: {_terminal_text(exception.get('message', ''))}"
+            )
     return "\n".join(lines)
 
 
@@ -258,6 +342,8 @@ def _format_json(results: list[dict[str, object]]) -> str:
             "risk_assessment": r.get("risk_assessment", {}),
             "components": r.get("components", []),
             "issues": r.get("issues", []),
+            "execution_successful": r.get("execution_successful", "error" not in r),
+            "analysis_completeness": _completeness(r),
             "scan_mode": r.get("scan_mode", "multilingual-enhanced"),
             "enhancements": r.get("enhancements", {}),
         }
@@ -266,13 +352,10 @@ def _format_json(results: list[dict[str, object]]) -> str:
         entries.append(entry)
 
     # Aggregate enhancement stats for the batch envelope
-    non_en_langs: set[str] = set()
+    languages = _language_counts(results)
     gap_fill_total = 0
     gap_fill_skills = 0
     for r in results:
-        lang = r.get("skill", {}).get("language", "en")
-        if lang != "en":
-            non_en_langs.add(lang)
         enhancements = r.get("enhancements", {})
         gap_fill_total += enhancements.get("gap_fill_findings", 0)
         if enhancements.get("gap_fill_applied"):
@@ -285,13 +368,13 @@ def _format_json(results: list[dict[str, object]]) -> str:
             "scan_mode": "multilingual-enhanced",
             "enhancements": {
                 "language_detection": "unicode-script-ratio",
-                "languages_detected": {lang: sum(
-                    1 for r in results
-                    if r.get("skill", {}).get("language") == lang
-                ) for lang in sorted(non_en_langs)},
+                "languages_detected": {
+                    lang: languages[lang] for lang in sorted(languages) if lang != "en"
+                },
                 "gap_fill_applied": gap_fill_skills,
                 "gap_fill_findings": gap_fill_total,
             },
+            "inspection_completeness": _inspection_summary(results),
         },
         "skills": entries,
         "metadata": {
@@ -311,7 +394,7 @@ def _format_markdown(results: list[dict[str, object]]) -> str:
     total = len(results)
 
     # ── Enhancement summary ─────────────────────────────────────
-    non_en = sum(1 for r in results if r.get("skill", {}).get("language", "en") != "en")
+    non_en = sum(count for lang, count in _language_counts(results).items() if lang != "en")
     gap_fill_total = sum(
         r.get("enhancements", {}).get("gap_fill_findings", 0) for r in results
     )
@@ -351,6 +434,11 @@ def _format_markdown(results: list[dict[str, object]]) -> str:
     lines.append(f"| 🔴 HIGH | {high} |")
     lines.append(f"| 🟡 MEDIUM | {medium} |")
     lines.append(f"| 🟢 LOW | {low_count} |")
+    inspection = _inspection_summary(results)
+    lines.append(f"| Failed executions | {inspection['failed_executions']} |")
+    lines.append(f"| Incomplete skills | {inspection['incomplete_skills']} |")
+    lines.append(f"| Partially inspected files | {inspection['partially_inspected_files']} |")
+    lines.append(f"| Entirely uninspected files | {inspection['entirely_uninspected_files']} |")
     lines.append("")
 
     lines.append("## Skills by Risk Score\n")
@@ -366,9 +454,12 @@ def _format_markdown(results: list[dict[str, object]]) -> str:
         lang = skill.get("language", "en")
 
         if r.get("error"):
-            lines.append(f"| `{name}` | ERR | ERROR | — | {lang} |")
+            lines.append(f"| {_markdown_code(name, table_cell=True)} | ERR | ERROR | — | {_markdown_text(lang)} |")
         else:
-            lines.append(f"| `{name}` | {score}/100 | {sev} | {issues} | {lang} |")
+            lines.append(
+                f"| {_markdown_code(name, table_cell=True)} | {score}/100 | {_markdown_text(sev)} | "
+                f"{issues} | {_markdown_text(lang)} |"
+            )
     lines.append("")
 
     # ── Issue details for HIGH / CRITICAL ────────────────────────
@@ -386,8 +477,8 @@ def _format_markdown(results: list[dict[str, object]]) -> str:
             risk = r.get("risk_assessment", {})
             name = skill.get("name", "?")
             lines.append(
-                f"### {name} — {risk.get('score', 0)}/100 "
-                f"{risk.get('severity', 'HIGH')}\n"
+                f"### {_markdown_text(name)} — {risk.get('score', 0)}/100 "
+                f"{_markdown_text(risk.get('severity', 'HIGH'))}\n"
             )
             for issue in r.get("issues", []):
                 sev = str(issue.get("severity", "LOW")).upper()
@@ -397,16 +488,29 @@ def _format_markdown(results: list[dict[str, object]]) -> str:
                 loc_file = loc.get("file", "") if isinstance(loc, dict) else ""
                 rule_id = issue.get("id", "?")
                 explanation = issue.get("explanation", issue.get("message", ""))
-                lines.append(f"- **{emoji} {rule_id}**: {explanation}")
+                lines.append(f"- **{emoji} {_markdown_text(rule_id)}**: {_markdown_text(explanation)}")
                 if loc_file:
-                    lines.append(f"  - Location: `{loc_file}:{loc_start}`")
+                    lines.append(f"  - Location: {_markdown_code(f'{loc_file}:{loc_start}')}")
                 conf = issue.get("confidence", 0)
                 lines.append(f"  - Confidence: {float(conf):.0%}")
                 rem = issue.get("remediation")
                 if rem:
-                    lines.append(f"  - Remediation: {rem}")
+                    lines.append(f"  - Remediation: {_markdown_text(rem)}")
                 lines.append("")
         lines.append("")
+
+    exception_groups = _exception_groups(results)
+    if exception_groups:
+        lines.append("## Ledger Exceptions\n")
+        for skill_name, exceptions in exception_groups:
+            lines.append(f"### {_markdown_text(skill_name)}\n")
+            for exception in exceptions:
+                lines.append(
+                    f"- **{_markdown_text(exception.get('reason_code', 'unknown'))}** "
+                    f"{_markdown_code(exception.get('path', ''))}: "
+                    f"{_markdown_text(exception.get('message', ''))}"
+                )
+            lines.append("")
 
     lines.append(f"\n*Generated by SkillSpector v{_skillspector_version}*")
     return "\n".join(lines)

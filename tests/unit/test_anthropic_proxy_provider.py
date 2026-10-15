@@ -42,6 +42,9 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("SKILLSPECTOR_MODEL", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
     monkeypatch.delenv("SKILLSPECTOR_SSL_VERIFY", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_TEMPERATURE", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_SEED", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("NVIDIA_INFERENCE_KEY", raising=False)
@@ -89,6 +92,67 @@ class TestAnthropicProxyProviderChatModel:
         assert isinstance(llm, _ChatAnthropicProxy)
         assert llm.model == "claude-sonnet-4-6"
         assert llm.max_tokens == 4096
+
+    @pytest.mark.parametrize("effort", ["provider-specific-value"])
+    def test_reasoning_effort_passthrough(
+        self, monkeypatch: pytest.MonkeyPatch, effort: str
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_proxy(**kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return kwargs
+
+        monkeypatch.setattr(
+            "skillspector.providers.anthropic_proxy.provider._ChatAnthropicProxy", fake_proxy
+        )
+        monkeypatch.setenv("ANTHROPIC_PROXY_API_KEY", "bearer-tok")
+        monkeypatch.setenv("ANTHROPIC_PROXY_ENDPOINT_URL", "https://proxy.example.com/predict")
+        monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", f" {effort} ")
+
+        AnthropicProxyProvider().create_chat_model("claude-sonnet-4-6", max_tokens=4096)
+
+        assert captured["effort"] == effort
+
+    @pytest.mark.parametrize("value", [None, "   "])
+    def test_reasoning_effort_blank_or_unset_omits_effort(
+        self, monkeypatch: pytest.MonkeyPatch, value: str | None
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_proxy(**kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return kwargs
+
+        monkeypatch.setattr(
+            "skillspector.providers.anthropic_proxy.provider._ChatAnthropicProxy", fake_proxy
+        )
+        monkeypatch.setenv("ANTHROPIC_PROXY_API_KEY", "bearer-tok")
+        monkeypatch.setenv("ANTHROPIC_PROXY_ENDPOINT_URL", "https://proxy.example.com/predict")
+        if value is not None:
+            monkeypatch.setenv("SKILLSPECTOR_REASONING_EFFORT", value)
+
+        AnthropicProxyProvider().create_chat_model("claude-sonnet-4-6", max_tokens=4096)
+
+        assert "effort" not in captured
+
+    def test_temperature_is_forwarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_proxy(**kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return kwargs
+
+        monkeypatch.setattr(
+            "skillspector.providers.anthropic_proxy.provider._ChatAnthropicProxy", fake_proxy
+        )
+        monkeypatch.setenv("ANTHROPIC_PROXY_API_KEY", "bearer-tok")
+        monkeypatch.setenv("ANTHROPIC_PROXY_ENDPOINT_URL", "https://proxy.example.com/predict")
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0.1")
+
+        AnthropicProxyProvider().create_chat_model("claude-sonnet-4-6", max_tokens=4096)
+
+        assert captured["temperature"] == 0.1
 
 
 class TestAnthropicProxyProviderMetadata:
@@ -211,6 +275,17 @@ class TestProxyTransport:
         assert body["max_tokens"] == 200
         assert body["temperature"] == 0.5
 
+    def test_preserves_output_config_effort(self) -> None:
+        _, body = self._make_request(
+            {
+                "model": "claude-sonnet-4-6",
+                "messages": [],
+                "max_tokens": 200,
+                "output_config": {"effort": "xhigh"},
+            }
+        )
+        assert body["output_config"]["effort"] == "xhigh"
+
 
 class TestApiVersionConfiguration:
     """Tests for ANTHROPIC_PROXY_API_VERSION env var."""
@@ -252,3 +327,26 @@ class TestProviderSelection:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-fallback")
         llm = create_chat_model("gpt-5.4", max_tokens=1024)
         assert isinstance(llm, ChatOpenAI)
+
+
+class TestAnthropicProxyProviderStructuredOutput:
+    """Proxy provider mirrors the native provider's structured-output hint."""
+
+    def test_json_schema_for_models_that_reject_forced_tool_calls(self) -> None:
+        assert (
+            AnthropicProxyProvider().structured_output_method("claude-fable-5-1") == "json_schema"
+        )
+        assert (
+            AnthropicProxyProvider().structured_output_method("claude-mythos-5-1") == "json_schema"
+        )
+
+    @pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-sonnet-5-5"])
+    def test_claude_5_5_uses_json_schema_with_registered_budgets(self, model: str) -> None:
+        provider = AnthropicProxyProvider()
+        assert provider.structured_output_method(model) == "json_schema"
+        assert provider.get_context_length(model) == 1_000_000
+        assert provider.get_max_output_tokens(model) == 128_000
+
+    def test_default_for_other_models(self) -> None:
+        assert AnthropicProxyProvider().structured_output_method("claude-sonnet-4-6") is None
+        assert AnthropicProxyProvider().structured_output_method("claude-fable-5") is None

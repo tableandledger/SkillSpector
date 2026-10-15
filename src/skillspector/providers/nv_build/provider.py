@@ -38,13 +38,13 @@ REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 class NvBuildProvider:
     """build.nvidia.com credentials + bundled-YAML metadata provider."""
 
-    # General default — DeepSeek v4 flash for the high-volume per-file
-    # analyzer calls.  meta_analyzer is upgraded to v4 pro for the
-    # aggregation/filter pass where precision matters more.
-    DEFAULT_MODEL = "deepseek-ai/deepseek-v4-flash"
-    SLOT_DEFAULTS: dict[str, str] = {
-        "meta_analyzer": "deepseek-ai/deepseek-v4-pro",
-    }
+    # GLM-5.2 is retired on the hosted endpoint (HTTP 410).
+    # Choose defaults for detection, not latency alone: a faster replacement
+    # previously missed the credential-disclosure control. GLM-5.3 detected
+    # SSD-3 on that control; the prompt-injection control remains unverified
+    # because its hosted requests timed out. Recheck both before replacing it.
+    DEFAULT_MODEL = "z-ai/glm-5.3"
+    SLOT_DEFAULTS: dict[str, str] = {}
 
     def resolve_credentials(self) -> tuple[str, str | None] | None:
         """Return ``(api_key, base_url)`` from ``NVIDIA_INFERENCE_KEY``."""
@@ -66,6 +66,9 @@ class NvBuildProvider:
             credentials=self.resolve_credentials(),
             max_tokens=max_tokens,
             timeout=timeout,
+            # GLM-5.3 otherwise defaults to maximum reasoning effort.
+            # https://build.nvidia.com/z-ai/glm-5-3/modelcard
+            default_reasoning_effort="high" if model == "z-ai/glm-5.3" else None,
         )
 
     def get_context_length(self, model: str) -> int | None:

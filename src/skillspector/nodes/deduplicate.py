@@ -1,104 +1,283 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-"""Cross-analyzer finding deduplication.
-
-Merges findings that represent the same conceptual issue observed multiple
-times — either within the same file or across files with identical patterns.
-
-Deduplication strategy:
-1. Same-file dedup: Same rule_id + same file + same matched_text
-   → keep highest confidence instance
-2. Cross-file consolidation: Same rule_id + same matched_text across files
-   → keep highest confidence instance
-"""
+"""Collision-resistant, occurrence-preserving finding compaction."""
 
 from __future__ import annotations
 
+import json
+from dataclasses import replace
+from hashlib import sha256
+
 from skillspector.logging_config import get_logger
-from skillspector.models import Finding
+from skillspector.models import (
+    OCCURRENCE_CODE_SNIPPET_KEY,
+    OCCURRENCE_FINDING_ID_KEY,
+    Finding,
+)
 
 logger = get_logger(__name__)
 
-
-def _same_file_key(finding: Finding) -> tuple[str, str, str]:
-    """Build a deduplication key for same-file matches."""
-    matched = (finding.matched_text or "").strip()[:100]
-    return (finding.rule_id, finding.file, matched)
+_SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
 
 
-def _cross_file_key(finding: Finding) -> tuple[str, str]:
-    """Build a cross-file deduplication key from rule_id and normalized matched_text."""
-    matched = (finding.matched_text or "").strip()[:100]
-    return (finding.rule_id, matched)
+def _occurrences(finding: Finding) -> list[dict[str, object]]:
+    if finding.occurrences:
+        occurrences = [dict(item) for item in finding.occurrences]
+        for occurrence in occurrences:
+            occurrence.setdefault(OCCURRENCE_FINDING_ID_KEY, finding.finding_id)
+            occurrence.setdefault(
+                OCCURRENCE_CODE_SNIPPET_KEY,
+                finding.code_snippet or finding.context,
+            )
+        return occurrences
+    return [
+        {
+            "file": finding.file,
+            "start_line": finding.start_line,
+            "end_line": finding.end_line,
+            **({"start_column": finding.start_column} if finding.start_column is not None else {}),
+            **({"end_column": finding.end_column} if finding.end_column is not None else {}),
+            "source_url": finding.source_url,
+            "source_identity": finding.source_identity,
+            "source_digest": finding.source_digest,
+            "transitive_depth": finding.transitive_depth,
+            OCCURRENCE_FINDING_ID_KEY: finding.finding_id,
+            OCCURRENCE_CODE_SNIPPET_KEY: finding.code_snippet or finding.context,
+        }
+    ]
+
+
+def _line(value: object, default: int) -> int:
+    return value if isinstance(value, int) else default
+
+
+def _finding_source_scope(finding: Finding) -> str:
+    """Return immutable provenance, including occurrence-only compatibility data."""
+    direct = finding.source_identity or finding.source_digest or finding.source_url
+    if direct:
+        return direct
+    for occurrence in finding.occurrences:
+        candidate = (
+            occurrence.get("source_identity")
+            or occurrence.get("source_digest")
+            or occurrence.get("source_url")
+        )
+        if candidate:
+            return str(candidate)
+    return ""
+
+
+def _evidence_metadata_key(finding: Finding) -> tuple[str, object]:
+    """Return a bounded, fail-closed identity for classification evidence."""
+    try:
+        canonical = json.dumps(
+            finding.evidence,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    except (RecursionError, TypeError, ValueError):
+        # ``Finding.evidence`` intentionally accepts arbitrary plugin metadata.
+        # Ambiguous values must never crash a scan or merge distinct findings.
+        return ("opaque", id(finding))
+    return ("sha256", sha256(canonical).digest())
+
+
+def classification_metadata_key(
+    finding: Finding,
+    *,
+    ignored_tags: frozenset[str] = frozenset(),
+) -> tuple[object, ...]:
+    """Return the classification semantics compacted occurrences must share.
+
+    Occurrence expansion reuses one representative finding's report fields.
+    Keeping classification fields in the compaction identity prevents a
+    benign-context match and an unsafe match with the same rule fingerprint
+    from inheriting each other's classification or evidence. Confidence and
+    location-specific context are intentionally excluded because compaction
+    retains one highest-confidence representative for equivalent findings.
+    """
+    return (
+        finding.message,
+        finding.severity,
+        finding.category,
+        finding.pattern,
+        finding.explanation,
+        finding.remediation,
+        finding.intent,
+        tuple(sorted(tag for tag in finding.tags if tag not in ignored_tags)),
+        _evidence_metadata_key(finding),
+    )
+
+
+def _representative_key(finding: Finding) -> tuple[object, ...]:
+    """Return a stable semantic rank without using opaque run-unique IDs."""
+    return (
+        _SEVERITY_ORDER.get(finding.severity.upper(), 4),
+        -finding.confidence,
+        finding.file,
+        finding.start_line,
+        finding.end_line is not None,
+        finding.end_line or 0,
+        finding.start_column is None,
+        finding.start_column or 0,
+        finding.end_column is None,
+        finding.end_column or 0,
+        finding.rule_id,
+        finding.message,
+        finding.category or "",
+        finding.pattern or "",
+        finding.finding or "",
+        finding.explanation or "",
+        finding.remediation or "",
+        finding.code_snippet or "",
+        finding.intent or "",
+        tuple(finding.tags),
+        finding.context or "",
+        finding.matched_text or "",
+        finding.source_identity or "",
+        finding.source_digest or "",
+        finding.source_url or "",
+        finding.transitive_depth,
+    )
+
+
+def _output_key(finding: Finding) -> tuple[object, ...]:
+    """Return a total semantic order for bounded downstream consumers."""
+    return (
+        _SEVERITY_ORDER.get(finding.severity.upper(), 4),
+        finding.file,
+        finding.start_line,
+        finding.rule_id,
+        _representative_key(finding),
+        _finding_source_scope(finding),
+        finding.fingerprint() or "",
+        json.dumps(
+            [
+                {
+                    key: value
+                    for key, value in occurrence.items()
+                    if key not in {OCCURRENCE_FINDING_ID_KEY, OCCURRENCE_CODE_SNIPPET_KEY}
+                }
+                for occurrence in finding.occurrences
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    )
 
 
 def deduplicate(findings: list[Finding]) -> list[Finding]:
-    """Deduplicate a list of findings, returning a reduced list.
-
-    Two-pass deduplication:
-    1. Same-file: identical (rule_id, file, matched_text) → keep highest confidence
-    2. Cross-file: identical (rule_id, matched_text) across different files
-       → keep highest confidence representative
-
-    Findings without matched_text are never cross-file deduplicated (they lack
-    a reliable identity signal).
-    """
-    if not findings:
-        return []
-
-    original_count = len(findings)
-
-    # Pass 1: Same-file deduplication
-    same_file_best: dict[tuple[str, str, str], Finding] = {}
-    for f in findings:
-        key = _same_file_key(f)
-        existing = same_file_best.get(key)
-        if existing is None or f.confidence > existing.confidence:
-            same_file_best[key] = f
-
-    after_same_file = list(same_file_best.values())
-
-    # Pass 2: Cross-file deduplication (only for findings WITH matched_text)
-    cross_file_best: dict[tuple[str, str], Finding] = {}
-    no_text_findings: list[Finding] = []
-
-    for f in after_same_file:
-        matched = (f.matched_text or "").strip()
-        if not matched:
-            no_text_findings.append(f)
+    """Aggregate classification-equivalent exact matches while preserving occurrences."""
+    groups: dict[tuple[str, str, str, tuple[object, ...]], list[Finding]] = {}
+    unique_without_match: list[Finding] = []
+    for finding in findings:
+        fingerprint = finding.fingerprint()
+        if fingerprint is None:
+            unique_without_match.append(finding)
             continue
-        key = _cross_file_key(f)
-        existing = cross_file_best.get(key)
-        if existing is None or f.confidence > existing.confidence:
-            cross_file_best[key] = f
+        source_scope = _finding_source_scope(finding)
+        groups.setdefault(
+            (
+                source_scope,
+                finding.rule_id,
+                fingerprint,
+                classification_metadata_key(finding),
+            ),
+            [],
+        ).append(finding)
 
-    deduplicated = list(cross_file_best.values()) + no_text_findings
-
-    removed = original_count - len(deduplicated)
-    if removed > 0:
-        logger.info(
-            "Deduplication: %d → %d findings (%d duplicates removed)",
-            original_count,
-            len(deduplicated),
-            removed,
+    compacted: list[Finding] = []
+    for (
+        _source_scope,
+        _rule_id,
+        _fingerprint,
+        _classification_metadata,
+    ), group in groups.items():
+        representative = min(group, key=_representative_key)
+        occurrences: dict[tuple[object, ...], tuple[object, object]] = {}
+        for finding in sorted(group, key=_representative_key):
+            for occurrence in _occurrences(finding):
+                location = (
+                    str(occurrence.get("file", "")),
+                    _line(occurrence.get("start_line"), 1),
+                    occurrence.get("end_line"),
+                    occurrence.get("start_column"),
+                    occurrence.get("end_column"),
+                    str(occurrence.get("source_identity") or finding.source_identity or ""),
+                    str(occurrence.get("source_digest") or finding.source_digest or ""),
+                    str(occurrence.get("source_url") or finding.source_url or ""),
+                    _line(occurrence.get("transitive_depth"), finding.transitive_depth),
+                )
+                occurrences.setdefault(
+                    location,
+                    (
+                        occurrence.get(OCCURRENCE_FINDING_ID_KEY, finding.finding_id),
+                        occurrence.get(
+                            OCCURRENCE_CODE_SNIPPET_KEY,
+                            finding.code_snippet or finding.context,
+                        ),
+                    ),
+                )
+        ordered_occurrences = [
+            {
+                "file": file,
+                "start_line": start,
+                "end_line": end,
+                **({"start_column": start_column} if start_column is not None else {}),
+                **({"end_column": end_column} if end_column is not None else {}),
+                **({"source_identity": source_identity} if source_identity else {}),
+                **({"source_digest": source_digest} if source_digest else {}),
+                **({"source_url": source_url} if source_url else {}),
+                **({"transitive_depth": transitive_depth} if transitive_depth else {}),
+                OCCURRENCE_FINDING_ID_KEY: report_finding_id,
+                OCCURRENCE_CODE_SNIPPET_KEY: report_code_snippet,
+            }
+            for (
+                (
+                    file,
+                    start,
+                    end,
+                    start_column,
+                    end_column,
+                    source_identity,
+                    source_digest,
+                    source_url,
+                    transitive_depth,
+                ),
+                (report_finding_id, report_code_snippet),
+            ) in sorted(
+                occurrences.items(),
+                key=lambda item: (
+                    item[0][5],
+                    item[0][6],
+                    item[0][7],
+                    item[0][8],
+                    item[0][0],
+                    item[0][1],
+                    _line(item[0][2], item[0][1]),
+                    _line(item[0][3], -1),
+                    _line(item[0][4], -1),
+                ),
+            )
+        ]
+        compacted.append(
+            replace(
+                representative,
+                occurrences=ordered_occurrences,
+            )
         )
 
-    severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-    deduplicated.sort(
-        key=lambda f: (severity_order.get(f.severity.upper(), 4), f.file, f.start_line)
-    )
-
-    return deduplicated
+    compacted.extend(unique_without_match)
+    compacted.sort(key=_output_key)
+    removed = len(findings) - len(compacted)
+    if removed:
+        logger.info(
+            "Deduplication: %d -> %d findings (%d exact duplicates aggregated)",
+            len(findings),
+            len(compacted),
+            removed,
+        )
+    return compacted

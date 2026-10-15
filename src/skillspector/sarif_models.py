@@ -38,8 +38,15 @@ class SarifRegion(BaseModel):
 class SarifArtifactLocation(BaseModel):
     """Reference to an artifact (file) in the run."""
 
+    model_config = {"populate_by_name": True}
+
     uri: str
+    # SARIF 2.1.0 section 3.4.4: base URI identifier resolved through the
+    # run's originalUriBaseIds. Recursive scans scope each child run's
+    # skill-relative URIs to its own skill directory with this.
+    uri_base_id: str | None = Field(default=None, alias="uriBaseId")
     index: int | None = None
+    properties: dict[str, object] | None = None
 
 
 class SarifPhysicalLocation(BaseModel):
@@ -97,6 +104,9 @@ class SarifReportingDescriptor(BaseModel):
     default_configuration: dict[str, object] | None = Field(
         default=None, alias="defaultConfiguration"
     )
+    # Rule-level metadata such as security-severity, emitted only when the
+    # rule has a single severity across every reported finding.
+    properties: dict[str, object] | None = None
 
 
 class SarifDriver(BaseModel):
@@ -120,14 +130,12 @@ class SarifArtifact(BaseModel):
 
 
 class SarifNotification(BaseModel):
-    """A notification about a condition encountered during tool execution.
-
-    Used to surface a degraded LLM stage (requested but every call failed) in
-    the default SARIF output via ``invocation.toolExecutionNotifications``.
-    """
+    """A notification about a condition encountered during tool execution."""
 
     text: SarifMessage = Field(alias="message")
     level: Literal["error", "warning", "note"] = "warning"
+    locations: list[SarifLocation] | None = None
+    properties: dict[str, object] | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -135,10 +143,7 @@ class SarifNotification(BaseModel):
 class SarifInvocation(BaseModel):
     """Describes a single tool invocation (SARIF ``run.invocations[]``).
 
-    ``executionSuccessful`` is required by the SARIF spec. SkillSpector keeps it
-    ``True`` even for a degraded LLM stage — the scan completed and produced
-    results — and conveys the degradation through a warning-level entry in
-    ``toolExecutionNotifications``.
+    ``executionSuccessful`` is derived from the canonical inspection ledger.
     """
 
     model_config = {"populate_by_name": True}
@@ -147,6 +152,7 @@ class SarifInvocation(BaseModel):
     tool_execution_notifications: list[SarifNotification] | None = Field(
         default=None, alias="toolExecutionNotifications"
     )
+    properties: dict[str, object] | None = None
 
 
 class SarifRun(BaseModel):
@@ -156,8 +162,16 @@ class SarifRun(BaseModel):
 
     tool: SarifTool
     results: list[SarifResult] = Field(default_factory=list)
+    column_kind: Literal["utf16CodeUnits", "unicodeCodePoints"] | None = Field(
+        default=None, alias="columnKind"
+    )
     artifacts: list[SarifArtifact] | None = None
     invocations: list[SarifInvocation] | None = None
+    # SARIF 2.1.0 section 3.14.14: resolves artifactLocation.uriBaseId
+    # values used by this run's results.
+    original_uri_base_ids: dict[str, SarifArtifactLocation] | None = Field(
+        default=None, alias="originalUriBaseIds"
+    )
 
 
 class SarifLog(BaseModel):

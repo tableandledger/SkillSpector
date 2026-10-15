@@ -52,7 +52,16 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import SecretStr
 
+from skillspector.inference_usage import (
+    register_chat_model_controls,
+    retained_chat_model_controls,
+)
 from skillspector.providers import registry
+from skillspector.providers.chat_models import (
+    resolve_reasoning_effort,
+    resolve_sampling_parameters,
+)
+from skillspector.providers.structured_output import rejects_forced_tool_call
 
 REGISTRY_PATH = str(Path(__file__).with_name("model_registry.yaml"))
 
@@ -231,15 +240,33 @@ class AnthropicProxyProvider:
 
         bearer_token, endpoint_url = creds
 
-        return _ChatAnthropicProxy(
-            proxy_endpoint_url=endpoint_url,
-            proxy_bearer_token=bearer_token,
-            model_name=model,
-            anthropic_api_key=SecretStr("anthropic-proxy-placeholder"),
-            max_tokens=max_tokens,
-            default_request_timeout=timeout,
-            stop_sequences=None,
+        kwargs = {
+            "proxy_endpoint_url": endpoint_url,
+            "proxy_bearer_token": bearer_token,
+            "model_name": model,
+            "anthropic_api_key": SecretStr("anthropic-proxy-placeholder"),
+            "max_tokens": max_tokens,
+            "default_request_timeout": timeout,
+            "stop_sequences": None,
+        }
+        effort = resolve_reasoning_effort()
+        if effort is not None:
+            kwargs["effort"] = effort
+        sampling_parameters = resolve_sampling_parameters(model)
+        kwargs.update(sampling_parameters)
+        chat_model = _ChatAnthropicProxy(**kwargs)
+        register_chat_model_controls(
+            chat_model,
+            retained_chat_model_controls(
+                chat_model,
+                ("temperature", "reasoning_effort"),
+            ),
+            requested_controls={
+                "temperature": sampling_parameters.get("temperature"),
+                "reasoning_effort": effort,
+            },
         )
+        return chat_model
 
     def get_context_length(self, model: str) -> int | None:
         return registry.lookup_context_length(REGISTRY_PATH, model)
@@ -251,3 +278,10 @@ class AnthropicProxyProvider:
         """Resolve model: ``SKILLSPECTOR_MODEL`` env > slot default > DEFAULT_MODEL."""
         user_input = os.environ.get("SKILLSPECTOR_MODEL", "").strip()
         return user_input or self.SLOT_DEFAULTS.get(slot, "") or self.DEFAULT_MODEL
+
+    def structured_output_method(self, model: str) -> str | None:
+        """``with_structured_output`` method for *model*: registry entry, then Claude name, else ``None``."""
+        declared = registry.lookup_structured_output_method(REGISTRY_PATH, model)
+        if declared:
+            return declared
+        return "json_schema" if rejects_forced_tool_call(model) else None

@@ -17,10 +17,12 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
+import skillspector.multi_skill as multi_skill_module
 from skillspector.multi_skill import detect_skills
 
 
@@ -65,6 +67,45 @@ def nested_with_root(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def _write_aisop_bundle(path: Path) -> None:
+    """Write a valid minimal AISOP/AISP bundle file."""
+    bundle = [
+        {
+            "role": "system",
+            "content": {
+                "protocol": "AISOP V1",
+                "format": "AIModal",
+            },
+        },
+        {
+            "role": "user",
+            "content": {
+                "aisop": {"main": "graph TD"},
+                "functions": {
+                    "lookup": {"constraints": ["query"]},
+                    "schedule": {"constraints": ["time"]},
+                },
+                "declared_tools": ["search", "calendar"],
+                "aisp_contract": {
+                    "resources": {
+                        "calendar": {"path": "resources/calendar.json"},
+                        "memory": {"path": "resources/memory.md"},
+                    }
+                },
+            },
+        },
+    ]
+    path.write_text(json.dumps(bundle), encoding="utf-8")
+
+
+def _make_nested_resources(depth: int) -> dict[str, object]:
+    """Build a deeply nested resources tree for recursion-guard tests."""
+    current: dict[str, object] = {"path": "resources/final.json"}
+    for idx in range(depth, -1, -1):
+        current = {f"resource_{idx}": {"resources": current}}
+    return current
+
+
 class TestDetectSkills:
     """Tests for detect_skills()."""
 
@@ -74,12 +115,167 @@ class TestDetectSkills:
         assert result.is_multi_skill is True
         assert len(result.skills) == 3
         assert result.has_root_skill is False
+        assert result.complete is True
+        assert [skill.relative_path for skill in result.skills] == [
+            "email-sender",
+            "file-manager",
+            "weather-lookup",
+        ]
 
     def test_skill_names_extracted_from_frontmatter(self, multi_skill_dir: Path) -> None:
         """Skill names come from SKILL.md frontmatter."""
         result = detect_skills(multi_skill_dir)
         names = {s.name for s in result.skills}
         assert names == {"weather-lookup", "email-sender", "file-manager"}
+
+    def test_skill_name_extracted_from_bom_prefixed_frontmatter(self, tmp_path: Path) -> None:
+        """A BOM-prefixed sub-skill resolves to its declared `name:`, not the directory name.
+
+        Regression guard: `_extract_skill_name` sniffs raw bytes for a leading
+        `b"---"` before decoding. A UTF-8 BOM (`b"\\xef\\xbb\\xbf"`) in front of that
+        delimiter used to defeat the sniff and silently fall back to `skill_dir.name`
+        instead of the frontmatter's declared name.
+        """
+        clean_dir = tmp_path / "clean-skill"
+        clean_dir.mkdir()
+        (clean_dir / "SKILL.md").write_bytes(
+            b"---\nname: clean-declared-name\ndescription: no BOM\n---\n# Clean\n"
+        )
+
+        bom_dir = tmp_path / "bom-dir-name"
+        bom_dir.mkdir()
+        (bom_dir / "SKILL.md").write_bytes(
+            b"\xef\xbb\xbf---\nname: bom-declared-name\ndescription: has a BOM\n---\n# BOM\n"
+        )
+
+        result = detect_skills(tmp_path)
+
+        names = {s.relative_path: s.name for s in result.skills}
+        assert names["clean-skill"] == "clean-declared-name"
+        assert names["bom-dir-name"] == "bom-declared-name"
+
+    def test_structured_skill_subdir_detected(self, tmp_path: Path) -> None:
+        """An immediate subdirectory with a valid AISOP/AISP bundle is detected."""
+        sub = tmp_path / "workflow-bundle"
+        sub.mkdir()
+        _write_aisop_bundle(sub / "workflow.aisop.json")
+        result = detect_skills(tmp_path)
+        assert result.is_multi_skill is False
+        assert result.has_root_skill is False
+        assert len(result.skills) == 1
+        assert result.skills[0].name == "workflow-bundle"
+        assert result.skills[0].path == sub
+
+    def test_structured_bundles_under_aisop_directories_are_detected(self, tmp_path: Path) -> None:
+        """The supported .aisop container is not treated as a generic hidden tree."""
+        for name in ("workflow-a", "workflow-b"):
+            sub = tmp_path / name
+            bundle_dir = sub / ".aisop"
+            bundle_dir.mkdir(parents=True)
+            _write_aisop_bundle(bundle_dir / "workflow.aisop.json")
+
+        result = detect_skills(tmp_path)
+
+        assert result.complete is True
+        assert result.is_multi_skill is True
+        assert {skill.name for skill in result.skills} == {"workflow-a", "workflow-b"}
+
+    def test_single_structured_child_not_multi(self, tmp_path: Path) -> None:
+        """One structured subdirectory should not force multi-skill mode."""
+        sub = tmp_path / "only-structured"
+        sub.mkdir()
+        _write_aisop_bundle(sub / "workflow.aisop.json")
+        result = detect_skills(tmp_path)
+        assert result.is_multi_skill is False
+        assert len(result.skills) == 1
+
+    @pytest.mark.parametrize("ancestor", [".claude", "venv"])
+    def test_structured_child_under_ancestor_detected(self, tmp_path: Path, ancestor: str) -> None:
+        """Structured children remain discoverable under external ancestors."""
+        skills_dir = tmp_path / ancestor / "skills"
+        sub = skills_dir / "workflow-bundle"
+        sub.mkdir(parents=True)
+        _write_aisop_bundle(sub / "workflow.aisop.json")
+
+        result = detect_skills(skills_dir)
+
+        assert len(result.skills) == 1
+        assert result.skills[0].path == sub
+
+    @pytest.mark.parametrize("skip_dir", ["venv", "node_modules", "__pycache__"])
+    def test_skip_dir_children_with_bundles_ignored(self, tmp_path: Path, skip_dir: str) -> None:
+        """Skip-dir children do not become phantom skills from vendored bundles."""
+        real_skill = tmp_path / "real-skill"
+        real_skill.mkdir()
+        (real_skill / "SKILL.md").write_text("---\nname: real\n---\n", encoding="utf-8")
+
+        bundled_child = tmp_path / skip_dir / "pkg"
+        bundled_child.mkdir(parents=True)
+        _write_aisop_bundle(bundled_child / "workflow.aisop.json")
+
+        result = detect_skills(tmp_path)
+
+        assert result.is_multi_skill is False
+        assert len(result.skills) == 1
+        assert result.skills[0].path == real_skill
+
+    def test_structured_bundle_ignored_when_partial(self, tmp_path: Path) -> None:
+        """Malformed AISOP/AISP JSON does not count as a structured child skill."""
+        malformed = tmp_path / "bad-bundle"
+        malformed.mkdir()
+        (malformed / "workflow.aisop.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "role": "system",
+                        "content": {"protocol": "AISOP V1"},
+                    },
+                    {"content": {"functions": []}},
+                ]
+            ),
+            encoding="utf-8",
+        )
+        result = detect_skills(tmp_path)
+        assert result.is_multi_skill is False
+        assert len(result.skills) == 0
+
+    def test_structured_bundle_ignored_when_over_nested(self, tmp_path: Path) -> None:
+        """Over-nested structured bundles fail closed instead of crashing detection."""
+        nested = tmp_path / "deep-bundle"
+        nested.mkdir()
+        bundle = [
+            {
+                "role": "system",
+                "content": {
+                    "protocol": "AISP V1",
+                    "format": "contract",
+                },
+            },
+            {
+                "role": "user",
+                "content": {
+                    "functions": {"lookup": {"constraints": ["query"]}},
+                    "aisp_contract": {"resources": _make_nested_resources(140)},
+                },
+            },
+        ]
+        (nested / "workflow.aisop.json").write_text(json.dumps(bundle), encoding="utf-8")
+
+        result = detect_skills(tmp_path)
+
+        assert result.is_multi_skill is False
+        assert len(result.skills) == 0
+
+    def test_root_skill_still_overrides_structured_nested(self, tmp_path: Path) -> None:
+        """A root SKILL.md still forces single-skill mode with nested structured bundles."""
+        (tmp_path / "SKILL.md").write_text("---\nname: root-skill\n---\n# Root\n", encoding="utf-8")
+        nested = tmp_path / "nested-structured"
+        nested.mkdir()
+        _write_aisop_bundle(nested / "workflow.aisop.json")
+        result = detect_skills(tmp_path)
+        assert result.is_multi_skill is False
+        assert result.has_root_skill is True
+        assert len(result.skills) == 0
 
     def test_single_skill_not_multi(self, single_skill_dir: Path) -> None:
         """Directory with root SKILL.md is not multi-skill."""
@@ -109,20 +305,189 @@ class TestDetectSkills:
         assert result.is_multi_skill is False
         assert len(result.skills) == 1
 
-    def test_hidden_directories_skipped(self, tmp_path: Path) -> None:
-        """Directories starting with '.' are not scanned for skills."""
+    def test_dot_prefixed_child_skill_is_discovered_with_explicit_skips(
+        self, tmp_path: Path
+    ) -> None:
+        """A dot-prefixed child skill is scanned without traversing explicit skips or links."""
         for name in ("skill-a", "skill-b"):
             sub = tmp_path / name
             sub.mkdir()
             (sub / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
-        hidden = tmp_path / ".hidden-skill"
-        hidden.mkdir()
-        (hidden / "SKILL.md").write_text("---\nname: hidden\n---\n", encoding="utf-8")
+        dot_prefixed = tmp_path / ".review-helper"
+        dot_prefixed.mkdir()
+        (dot_prefixed / "SKILL.md").write_text("---\nname: review-helper\n---\n", encoding="utf-8")
+        skipped = tmp_path / ".git"
+        skipped.mkdir()
+        (skipped / "SKILL.md").write_text("---\nname: skipped\n---\n", encoding="utf-8")
+        linked_target = tmp_path.parent / f"{tmp_path.name}-linked-target"
+        linked_target.mkdir()
+        (linked_target / "SKILL.md").write_text("---\nname: linked\n---\n", encoding="utf-8")
+        try:
+            (tmp_path / "linked-skill").symlink_to(linked_target, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+
         result = detect_skills(tmp_path)
+
         assert result.is_multi_skill is True
-        assert len(result.skills) == 2
-        names = {s.name for s in result.skills}
-        assert "hidden" not in names
+        assert [skill.relative_path for skill in result.skills] == [
+            ".review-helper",
+            "skill-a",
+            "skill-b",
+        ]
+        assert {skill.name for skill in result.skills} == {
+            "review-helper",
+            "skill-a",
+            "skill-b",
+        }
+        assert [skill.local_only for skill in result.skills] == [True, False, False]
+        assert result.omitted_symlink_entries == 1
+
+    def test_symlinked_skill_directory_marks_discovery_incomplete(self, tmp_path: Path) -> None:
+        """Detection must not silently claim complete coverage through a directory symlink."""
+        for name in ("skill-a", "skill-b"):
+            sub = tmp_path / name
+            sub.mkdir()
+            (sub / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+        external = tmp_path.parent / "external-skill"
+        external.mkdir()
+        (external / "SKILL.md").write_text("---\nname: private\n---\n", encoding="utf-8")
+        try:
+            (tmp_path / "linked-skill").symlink_to(external, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+
+        result = detect_skills(tmp_path)
+
+        assert result.is_multi_skill is True
+        assert {skill.name for skill in result.skills} == {"skill-a", "skill-b"}
+        assert result.complete is False
+        assert result.limitations[0].reason_code == "read_error"
+        assert result.limitations[0].resource == "multi_skill_symlinked_entry"
+        assert result.omitted_symlink_entries == 1
+
+    def test_ignored_name_symlinks_do_not_mark_discovery_incomplete(self, tmp_path: Path) -> None:
+        """Symlinks with intentionally ignored names are skipped, not recorded.
+
+        Closes rng1995 review on #499: a symlinked `.git`, `.venv`, or
+        `node_modules` must not make an otherwise complete scan incomplete,
+        while a genuinely eligible symlinked child still records the
+        `multi_skill_symlinked_entry` limitation.
+        """
+        for name in ("skill-a", "skill-b"):
+            sub = tmp_path / name
+            sub.mkdir()
+            (sub / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+        external = tmp_path.parent / f"{tmp_path.name}-external-skill-499"
+        external.mkdir()
+        (external / "SKILL.md").write_text("---\nname: private\n---\n", encoding="utf-8")
+        try:
+            for ignored in (".git", ".venv", "node_modules"):
+                (tmp_path / ignored).symlink_to(external, target_is_directory=True)
+            (tmp_path / "linked-skill").symlink_to(external, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+
+        result = detect_skills(tmp_path)
+
+        assert result.is_multi_skill is True
+        assert {skill.name for skill in result.skills} == {"skill-a", "skill-b"}
+        assert [lim.resource for lim in result.limitations] == ["multi_skill_symlinked_entry"]
+
+        ignored_only = tmp_path / "ignored-only"
+        ignored_only.mkdir()
+        for name in ("skill-c", "skill-d"):
+            sub = ignored_only / name
+            sub.mkdir()
+            (sub / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+        try:
+            for ignored in (".git", "node_modules"):
+                (ignored_only / ignored).symlink_to(external, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+
+        result = detect_skills(ignored_only)
+
+        assert result.complete is True
+        assert result.limitations == ()
+        assert {skill.name for skill in result.skills} == {"skill-c", "skill-d"}
+
+    def test_eligible_dot_prefixed_symlink_is_not_silently_excluded(self, tmp_path: Path) -> None:
+        """An eligible dot-prefixed symlinked skill is recorded, not skipped.
+
+        Closes rng1995 review on #499: a symlinked `.review-helper` is an
+        eligible local-only skill name, so it must record the
+        `multi_skill_symlinked_entry` limitation instead of being silently
+        excluded by the blanket dot-name exemption. The genuinely ignored
+        `.git` symlink alongside it is still skipped per the `_SKIP_DIRS`
+        policy and contributes no limitation of its own.
+        """
+        for name in ("skill-a", "skill-b"):
+            sub = tmp_path / name
+            sub.mkdir()
+            (sub / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+        review_helper_target = tmp_path.parent / f"{tmp_path.name}-review-helper-499"
+        review_helper_target.mkdir()
+        (review_helper_target / "SKILL.md").write_text(
+            "---\nname: review-helper\n---\n", encoding="utf-8"
+        )
+        git_target = tmp_path.parent / f"{tmp_path.name}-git-target-499"
+        git_target.mkdir()
+        (git_target / "SKILL.md").write_text("---\nname: ignored\n---\n", encoding="utf-8")
+        try:
+            (tmp_path / ".review-helper").symlink_to(review_helper_target, target_is_directory=True)
+            (tmp_path / ".git").symlink_to(git_target, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+
+        result = detect_skills(tmp_path)
+
+        assert result.is_multi_skill is True
+        assert {skill.name for skill in result.skills} == {"skill-a", "skill-b"}
+        assert result.complete is False
+        assert [lim.resource for lim in result.limitations] == ["multi_skill_symlinked_entry"]
+        assert result.limitations[0].reason_code == "read_error"
+        assert result.omitted_symlink_entries == 1
+
+    def test_ignored_name_symlink_is_not_counted_as_omitted(self, tmp_path: Path) -> None:
+        """An ignored-name symlink does not inflate the omission count."""
+        for name in ("skill-a", "skill-b"):
+            sub = tmp_path / name
+            sub.mkdir()
+            (sub / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+        ignored_target = tmp_path.parent / f"{tmp_path.name}-ignored-target"
+        ignored_target.mkdir()
+        (ignored_target / "SKILL.md").write_text("---\nname: mod\n---\n", encoding="utf-8")
+        linked_target = tmp_path.parent / f"{tmp_path.name}-linked-target"
+        linked_target.mkdir()
+        (linked_target / "SKILL.md").write_text("---\nname: linked\n---\n", encoding="utf-8")
+        try:
+            (tmp_path / "node_modules").symlink_to(ignored_target, target_is_directory=True)
+            (tmp_path / "linked-skill").symlink_to(linked_target, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+
+        result = detect_skills(tmp_path)
+
+        assert result.is_multi_skill is True
+        assert {skill.name for skill in result.skills} == {"skill-a", "skill-b"}
+        assert result.omitted_symlink_entries == 1
+
+    def test_symlinked_root_is_not_detected(self, tmp_path: Path) -> None:
+        """Direct callers cannot use detection to inspect a symlinked root."""
+        external = tmp_path / "external"
+        external.mkdir()
+        (external / "SKILL.md").write_text("---\nname: private\n---\n", encoding="utf-8")
+        symlink = tmp_path / "linked-root"
+        try:
+            symlink.symlink_to(external, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+
+        result = detect_skills(symlink)
+
+        assert result.is_multi_skill is False
+        assert result.has_root_skill is False
 
     def test_nonexistent_path(self, tmp_path: Path) -> None:
         """Non-existent path returns not multi-skill."""
@@ -141,6 +506,165 @@ class TestDetectSkills:
         for skill in result.skills:
             assert "/" not in skill.relative_path
             assert skill.relative_path == skill.path.name
+
+    def test_relative_root_produces_absolute_skill_paths(
+        self, multi_skill_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Relative caller input is normalized before child paths are returned."""
+        monkeypatch.chdir(multi_skill_dir.parent)
+
+        result = detect_skills(Path(multi_skill_dir.name))
+
+        assert result.complete is True
+        assert all(skill.path.is_absolute() for skill in result.skills)
+
+    def test_real_high_entry_count_fails_closed_without_partial_skills(
+        self, tmp_path: Path
+    ) -> None:
+        """A directory beyond the real retained-entry bound is explicitly partial."""
+        for index in range(multi_skill_module.MAX_MULTI_SKILL_DIRECTORY_ENTRIES + 1):
+            (tmp_path / f"entry-{index:05d}").touch()
+
+        result = detect_skills(tmp_path)
+
+        assert result.complete is False
+        assert result.is_multi_skill is False
+        assert result.skills == []
+        assert result.entries_examined == (multi_skill_module.MAX_MULTI_SKILL_DIRECTORY_ENTRIES + 1)
+        limitation = result.limitations[0]
+        assert limitation.reason_code == "artifact_count_limit"
+        assert limitation.resource == "multi_skill_directory_entries"
+        assert limitation.observed_artifacts == result.entries_examined
+        assert limitation.limit_artifacts == (multi_skill_module.MAX_MULTI_SKILL_DIRECTORY_ENTRIES)
+        assert limitation.as_ledger_metadata()["path"] == "."
+
+    def test_shared_runtime_limit_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The deadline covers enumeration and every child classifier."""
+        (tmp_path / "ordinary-entry").touch()
+        ticks = iter((0.0, 0.0, multi_skill_module.MAX_MULTI_SKILL_RUNTIME_SECONDS))
+        monkeypatch.setattr(
+            multi_skill_module.time,
+            "monotonic",
+            lambda: next(ticks, multi_skill_module.MAX_MULTI_SKILL_RUNTIME_SECONDS),
+        )
+
+        result = detect_skills(tmp_path)
+
+        assert result.complete is False
+        assert result.skills == []
+        limitation = result.limitations[0]
+        assert limitation.reason_code == "runtime_limit"
+        assert limitation.resource == "multi_skill_runtime"
+        assert limitation.limit_seconds == multi_skill_module.MAX_MULTI_SKILL_RUNTIME_SECONDS
+
+    def test_real_oversized_manifest_frontmatter_fails_closed(self, tmp_path: Path) -> None:
+        """Name extraction reads at most the documented frontmatter prefix."""
+        oversized = tmp_path / "a-oversized"
+        oversized.mkdir()
+        payload = b"---\nname: " + b"x" * (
+            multi_skill_module.MAX_MULTI_SKILL_MANIFEST_FRONTMATTER_BYTES + 1
+        )
+        (oversized / "SKILL.md").write_bytes(payload)
+        normal = tmp_path / "b-normal"
+        normal.mkdir()
+        (normal / "SKILL.md").write_text("---\nname: normal\n---\n", encoding="utf-8")
+
+        result = detect_skills(tmp_path)
+
+        assert len(payload) > multi_skill_module.MAX_MULTI_SKILL_MANIFEST_FRONTMATTER_BYTES
+        assert result.complete is False
+        assert result.is_multi_skill is False
+        assert result.skills == []
+        limitation = result.limitations[0]
+        assert limitation.reason_code == "manifest_parse_limit"
+        assert limitation.resource == "multi_skill_manifest_bytes"
+        assert limitation.observed_bytes == (
+            multi_skill_module.MAX_MULTI_SKILL_MANIFEST_FRONTMATTER_BYTES + 1
+        )
+        assert limitation.limit_bytes == (
+            multi_skill_module.MAX_MULTI_SKILL_MANIFEST_FRONTMATTER_BYTES
+        )
+
+    def test_large_body_after_bounded_frontmatter_is_complete(self, tmp_path: Path) -> None:
+        """Only frontmatter, rather than an unrelated large body, is bounded."""
+        for name in ("alpha", "beta"):
+            child = tmp_path / name
+            child.mkdir()
+            (child / "SKILL.md").write_bytes(
+                f"---\nname: {name}\n---\n".encode()
+                + b"x" * multi_skill_module.MAX_MULTI_SKILL_MANIFEST_FRONTMATTER_BYTES
+            )
+
+        result = detect_skills(tmp_path)
+
+        assert result.complete is True
+        assert result.is_multi_skill is True
+        assert {skill.name for skill in result.skills} == {"alpha", "beta"}
+
+    def test_structured_candidates_share_one_aggregate_bound(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Many child probes cannot multiply the structured candidate ceiling."""
+        monkeypatch.setattr(multi_skill_module, "MAX_MULTI_SKILL_STRUCTURED_CANDIDATES", 1)
+        candidate_dir = tmp_path / "a-candidates"
+        candidate_dir.mkdir()
+        (candidate_dir / "one.aisop.json").write_text("{}", encoding="utf-8")
+        (candidate_dir / "two.aisop.json").write_text("{}", encoding="utf-8")
+        normal = tmp_path / "b-normal"
+        normal.mkdir()
+        (normal / "SKILL.md").write_text("---\nname: normal\n---\n", encoding="utf-8")
+
+        result = detect_skills(tmp_path)
+
+        assert result.complete is False
+        assert result.skills == []
+        assert result.structured_candidates_examined == 2
+        limitation = result.limitations[0]
+        assert limitation.reason_code == "artifact_count_limit"
+        assert limitation.resource == "multi_skill_structured_candidates"
+
+    def test_symlinked_ancestor_is_explicitly_incomplete(self, tmp_path: Path) -> None:
+        """Direct callers cannot make discovery traverse a symlinked ancestor."""
+        actual_parent = tmp_path / "actual-parent"
+        skill_root = actual_parent / "skills"
+        skill_root.mkdir(parents=True)
+        link = tmp_path / "linked-parent"
+        try:
+            link.symlink_to(actual_parent, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks are not supported on this filesystem")
+
+        result = detect_skills(link / "skills")
+
+        assert result.complete is False
+        assert result.skills == []
+        assert result.limitations[0].resource == "multi_skill_input_path"
+
+    def test_console_facing_names_are_sanitized(self, tmp_path: Path) -> None:
+        """Manifest and directory names cannot inject Rich markup or controls."""
+        for directory_name, manifest_name in (
+            ("alpha[bold]", "[red]alpha[/red]"),
+            ("beta", "beta\x1b[31m"),
+        ):
+            child = tmp_path / directory_name
+            child.mkdir()
+            (child / "SKILL.md").write_text(
+                f"---\nname: '{manifest_name}'\n---\n",
+                encoding="utf-8",
+            )
+
+        result = detect_skills(tmp_path)
+
+        assert result.complete is True
+        assert result.is_multi_skill is True
+        for skill in result.skills:
+            assert "[" not in skill.name
+            assert "]" not in skill.name
+            assert "\x1b" not in skill.name
+            assert "[" not in skill.relative_path
+            assert "]" not in skill.relative_path
 
     def test_fallback_name_from_dirname(self, tmp_path: Path) -> None:
         """If SKILL.md has no name in frontmatter, use directory name."""

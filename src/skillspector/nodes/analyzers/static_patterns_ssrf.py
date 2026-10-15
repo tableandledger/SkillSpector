@@ -36,16 +36,19 @@ ANALYZER_ID = "static_patterns_ssrf"
 _REQ = r"(?:requests|httpx|aiohttp|urllib(?:\.request)?|urllib3|session)\s*\.\s*(?:get|post|put|patch|delete|head|request|urlopen)|fetch|axios(?:\.\w+)?|XMLHttpRequest|\bcurl\b|\bwget\b"
 
 # SSRF1: Cloud instance metadata endpoints (credential theft).
-SSRF1_PATTERNS = [
+SSRF1_ENDPOINT_PATTERNS = [
     (r"169\.254\.169\.254", 0.9),  # AWS / GCP / Azure / OpenStack IMDS
     (r"metadata\.google\.internal", 0.9),
     (r"100\.100\.100\.200", 0.85),  # Alibaba Cloud
     (r"fd00:ec2::254", 0.85),  # AWS IMDS over IPv6
+]
+SSRF1_PROSE_PATTERNS = [
     (
         r"(?:read|fetch|get|query)\s+(?:the\s+)?(?:instance\s+)?metadata\s+(?:service|endpoint|server)",
         0.6,
     ),
 ]
+SSRF1_PATTERNS = SSRF1_ENDPOINT_PATTERNS + SSRF1_PROSE_PATTERNS
 
 # SSRF2: Requests to loopback / link-local / private (internal) hosts.
 SSRF2_PATTERNS = [
@@ -64,6 +67,45 @@ SSRF3_PATTERNS = [
     (r"fetch\s*\(\s*`https?://\$\{", 0.6),
 ]
 
+_SSRF_DEFENSE_CONTEXT_RE = re.compile(
+    r"\bssrf(?:[\s-]+)refusal\b|"
+    r"\b(?:reject(?:s|ed|ing)?|refus(?:e|es|ed|al|ing)|block(?:s|ed|ing)?|"
+    r"deny|denies|denied|disallow(?:s|ed|ing)?)\b[^.\n]{0,160}"
+    r"\b(?:ssrf|fetch|request|target|host|endpoint|address|loopback|link-local|private|metadata)\b|"
+    r"\b(?:ssrf|fetch|request|target|host|endpoint|address|space|loopback|link-local|private|metadata)\b"
+    r"[^.\n]{0,160}\b(?:is\s+|are\s+)?(?:rejected|refused|blocked|denied|disallowed)\b|"
+    r"\bprevent(?:s|ed|ing)?\b[^.\n]{0,80}\bssrf\b",
+    re.IGNORECASE,
+)
+_DEFENSIVE_REQUEST_RE = re.compile(
+    r"\b(?:refus(?:e|es|ed|ing)\s+to|reject(?:s|ed|ing)?|block(?:s|ed|ing)?|"
+    r"deny|denies|denied|never|must\s+not|do\s+not|don'?t)\s+"
+    r"(?:attempts?\s+to\s+)?(?:fetch|get|request|access|connect|contact|curl|wget)\b",
+    re.IGNORECASE,
+)
+_REQUEST_ISSUER_RE = re.compile(_REQ, re.IGNORECASE)
+
+
+def _is_defensive_reference(content: str, match: re.Match[str]) -> bool:
+    """Return True when an SSRF indicator documents an explicit rejection rule.
+
+    A request issuer on the matched line wins over nearby defensive prose. This
+    keeps executable calls and direct "fetch" instructions detectable while
+    allowing security requirements and guard documentation to name the endpoint.
+    """
+    line_start = content.rfind("\n", 0, match.start()) + 1
+    line_end = content.find("\n", match.end())
+    if line_end == -1:
+        line_end = len(content)
+    matched_line = content[line_start:line_end]
+    if _DEFENSIVE_REQUEST_RE.search(matched_line):
+        return True
+    if _REQUEST_ISSUER_RE.search(matched_line):
+        return False
+
+    context = get_context(content, match.start(), context_lines=5)
+    return bool(_SSRF_DEFENSE_CONTEXT_RE.search(context))
+
 
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for server-side request forgery patterns (SSRF1–SSRF3)."""
@@ -74,7 +116,14 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
         rule_id: str, message: str, severity: Severity, patterns: list[tuple[str, float]]
     ) -> None:
         for pattern, confidence in patterns:
-            for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            matches = (
+                static_runner.iter_paragraph_matches
+                if (pattern, confidence) in SSRF1_PROSE_PATTERNS
+                else re.finditer
+            )
+            for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+                if rule_id == "SSRF1" and _is_defensive_reference(content, match):
+                    continue
                 line_num = get_line_number(content, match.start())
                 findings.append(
                     AnalyzerFinding(
@@ -86,6 +135,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                         tags=tag,
                         context=get_context(content, match.start()),
                         matched_text=match.group(0)[:200],
+                        complete_match=match.group(0),
                     )
                 )
 
@@ -97,6 +147,6 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run SSRF patterns and return findings."""
-    findings = static_runner.run_static_patterns(state, [sys.modules[__name__]])
-    logger.info("%s: %d findings", ANALYZER_ID, len(findings))
-    return {"findings": findings}
+    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
+    return response

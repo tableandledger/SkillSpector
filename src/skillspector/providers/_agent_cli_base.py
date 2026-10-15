@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared base for local agent-CLI providers (claude_cli, codex_cli, gemini_cli).
+"""Shared base for local agent-CLI providers (claude_cli, codex_cli,
+gemini_cli, opencode_cli).
 
 A concrete provider is just four class attributes (see how thin
 ``ClaudeCLIProvider`` / ``CodexCLIProvider`` / ``GeminiCLIProvider`` are). All
@@ -35,12 +36,11 @@ class AgentCLIProviderBase:
 
     #: CLI name; must be a key in ``_agent_cli._REGISTRY``.
     BINARY_NAME: str = ""
-    #: Always "" for CLI providers — the user's own CLI-configured model is used
-    #: (we omit ``--model``). Present only so constants.py's
+    #: Always "" for CLI providers. Present only so constants.py's
     #: ``_provider.DEFAULT_MODEL`` lookup has an attribute; never pins a version.
     DEFAULT_MODEL: str = ""
     #: Optional path to a bundled ``model_registry.yaml`` for token budgets. CLI
-    #: providers leave this empty and fall back to package-wide default budgets.
+    #: providers leave this empty, but users can supply a global registry override.
     REGISTRY_PATH: str = ""
 
     # -- Credentials ---------------------------------------------------------
@@ -57,7 +57,14 @@ class AgentCLIProviderBase:
 
     # -- Transport -----------------------------------------------------------
 
-    def complete(self, prompt: str, *, model: str, max_output_tokens: int = 8192) -> str:
+    def complete(
+        self,
+        prompt: str,
+        *,
+        model: str,
+        max_output_tokens: int = 8192,
+        timeout: float | None = None,
+    ) -> str:
         """Invoke the CLI via the hardened runner and return the assistant text.
 
         The prompt is passed through unchanged (parity with the HTTP path).
@@ -65,28 +72,26 @@ class AgentCLIProviderBase:
         :func:`skillspector.providers._agent_cli.run_agent_cli`.
         """
         return _agent_cli.run_agent_cli(
-            self.BINARY_NAME, prompt, model=model, max_output_tokens=max_output_tokens
+            self.BINARY_NAME,
+            prompt,
+            model=model,
+            max_output_tokens=max_output_tokens,
+            timeout=timeout if timeout is not None else _agent_cli.CLI_TIMEOUT_SECONDS,
         )
 
     # -- Metadata ------------------------------------------------------------
 
     def get_context_length(self, model: str) -> int | None:
-        if not self.REGISTRY_PATH:
-            return None  # no registry -> caller uses the package-wide default budget
         return registry.lookup_context_length(self.REGISTRY_PATH, model)
 
     def get_max_output_tokens(self, model: str) -> int | None:
-        if not self.REGISTRY_PATH:
-            return None
         return registry.lookup_max_output_tokens(self.REGISTRY_PATH, model)
 
     def resolve_model(self, slot: str = "default") -> str:
         """Return the model to forward to the CLI.
 
-        CLI providers default to the user's OWN CLI-configured model (we omit
-        ``--model`` entirely), so this returns ``""`` unless the user explicitly
-        sets ``SKILLSPECTOR_MODEL`` to override it. No model versions are pinned
-        here — that keeps the providers version-proof and respects the user's own
-        default model / thinking-level configuration.
+        CLI providers omit ``--model`` unless ``SKILLSPECTOR_MODEL`` is set, so
+        this returns ``""`` by default. Each CLI then applies whatever fallback
+        model behaviour its own settings and runtime contract define.
         """
         return os.environ.get("SKILLSPECTOR_MODEL", "").strip()
